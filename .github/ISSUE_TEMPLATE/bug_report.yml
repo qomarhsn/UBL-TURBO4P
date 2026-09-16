@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a problem with the unlock script
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! No technical knowledge needed.
+        Just describe what happened and attach the log file `unlock_log_*.txt`
+        from the same folder as `unlock.sh` (it contains all the details automatically).
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem in plain words.
+      placeholder: e.g. "The script failed at STEP 2" or "My phone is stuck on the fastboot screen"
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file (unlock_log_*.txt)
+      description: Attach the log file here — or paste it fully (it includes version, method, host info and all commands automatically).
+      render: text
+    validations:
+      required: true
