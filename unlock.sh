@@ -63,10 +63,14 @@ dump_environment() { # collect all diagnostics into the log for bug reports
 }
 
 confirm() { # confirm [prompt]
-  local p="${1:-continue?}"
+  local p="${1:-continue?}" reply=""
   if [ "$STEP_USER_CONFIRM" = "0" ]; then return 0; fi
   echo -en "${YELLOW}?${RESET} $p (Y/n): "
-  read -r -n1 -s reply; echo
+  # Read from the terminal, not stdin (adb shell eats piped stdin); fall back to stdin.
+  if ! read -r -n1 -s reply </dev/tty 2>/dev/null; then
+    read -r -n1 -s reply </dev/stdin 2>/dev/null || reply=""
+  fi
+  echo
   [ "$reply" != "n" ] && [ "$reply" != "N" ]
 }
 
@@ -84,9 +88,9 @@ run() { # run <quiet?> <description> <command...>
   log "> $desc :: $*"
   if [ "$DRY_RUN" = "1" ]; then warn "DRY-RUN: skipped -> $*"; return 0; fi
   if [ "$quiet" = "1" ]; then
-    "$@" >/dev/null 2>&1 && ok "$desc [OK]" || { err "$desc [FAILED]"; return 1; }
+    if "$@" >/dev/null 2>&1; then ok "$desc [OK]"; else err "$desc [FAILED] — aborting."; log "FAILED: $*"; exit 1; fi
   else
-    "$@" && ok "$desc [OK]" || { err "$desc [FAILED]"; return 1; }
+    if "$@"; then ok "$desc [OK]"; else err "$desc [FAILED] — aborting."; log "FAILED: $*"; exit 1; fi
   fi
 }
 
@@ -103,13 +107,14 @@ adb_wait_phone() {
 
 fastboot_wait() {
   info "Waiting for phone in FASTBOOT mode... (Volume Down + Power to enter)"
-  local t=0
-  until fastboot devices >/dev/null 2>&1; do
+  local t=0 out
+  # NB: `fastboot devices` exits 0 even with NO device — must check output is non-empty.
+  until { out=$(fastboot devices 2>/dev/null) && [ -n "$out" ]; }; do
     [ $DRY_RUN = 1 ] && { warn "DRY-RUN: skipping wait"; return 0; }
     t=$((t+1)); [ $t -gt 120 ] && { err "No FASTBOOT device after 4min."; exit 1; }
     sleep 2
   done
-  ok "Fastboot ready."
+  ok "Fastboot ready. device: $(echo "$out" | awk '{print $1}')"
 }
 
 # ========================== VERSION DETECT ===========================
@@ -144,14 +149,25 @@ unlock_service() {
 
   confirm "STEP 1/3 · set permissive flag + reboot to system?" || return 1
   run 0 "Set permissive boot flag" fastboot oem set-gpu-preemption 0 "androidboot.selinux=permissive"
-  run 0 "Reboot to system" fastboot reboot
+  # Prefer `continue` (resumes boot with the permissive cmdline intact, per the kit);
+  # some bootloaders don't implement it — fall back to a plain reboot then.
+  if [ "$DRY_RUN" = "1" ]; then
+    run 0 "Continue boot to system" fastboot continue
+  elif fastboot continue >/dev/null 2>&1; then
+    ok "Continue boot to system [OK]"
+  else
+    warn "'fastboot continue' failed or unsupported — falling back to 'fastboot reboot'"
+    run 0 "Reboot to system (fallback)" fastboot reboot
+  fi
   adb_wait_phone
 
   confirm "STEP 2/3 · MQSAS exploit to flash engineering ABL?" || return 1
   run 0 "Push abl.elf" adb push "$SCRIPT_DIR/abl.elf" /data/local/tmp/abl
-  run 1 "Exploit: write abl_a" adb shell service call miui.mqsas.IMQSNative 21 i32 1 s16 "dd" i32 1 s16 "if=/data/local/tmp/abl of=/dev/block/by-name/abl_a" s16 "/data/mqsas/log.txt" i32 60
+  # NB: the whole device command must go as ONE adb shell string with INNER quotes —
+  # otherwise the device shell splits `if=... of=...` and the service call is malformed.
+  run 1 "Exploit: write abl_a" adb shell "service call miui.mqsas.IMQSNative 21 i32 1 s16 'dd' i32 1 s16 'if=/data/local/tmp/abl of=/dev/block/by-name/abl_a' s16 '/data/mqsas/log.txt' i32 60"
   sleep 1
-  run 1 "Exploit: write abl_b" adb shell service call miui.mqsas.IMQSNative 21 i32 1 s16 "dd" i32 1 s16 "if=/data/local/tmp/abl of=/dev/block/by-name/abl_b" s16 "/data/mqsas/log.txt" i32 60
+  run 1 "Exploit: write abl_b" adb shell "service call miui.mqsas.IMQSNative 21 i32 1 s16 'dd' i32 1 s16 'if=/data/local/tmp/abl of=/dev/block/by-name/abl_b' s16 '/data/mqsas/log.txt' i32 60"
   sleep 1
   run 0 "Reboot to bootloader" adb reboot bootloader
   fastboot_wait
@@ -195,6 +211,8 @@ unlock_preload() {
 
 # ======================== FINAL STEP (SHARED) ========================
 restore_gpt_and_apps() {
+  if [ "$DRY_RUN" = "1" ]; then warn "DRY-RUN: skipping unlock check + GPT restore."; return 0; fi
+  # NB: `fastboot getvar` BLOCKS forever with no device — only run after fastboot_wait.
   local out
   out=$(fastboot getvar unlocked 2>&1)
   if echo "$out" | grep -qiE "unlocked: *(yes|true|1)"; then
@@ -261,6 +279,7 @@ main() {
   echo "────────────────────────────────────────────────────────────"
   warn "UNLOCK WIPES ALL DATA on the phone."
   warn "Remove Mi/Google accounts + screen lock BEFORE continuing."
+  warn "Uninstall the KernelSU app first if you ever used KSU root (kit requirement)."
   warn "Backup important files now."
   confirm "Backup done & accounts removed? Proceed with $METHOD?" || exit 0
 
@@ -269,10 +288,10 @@ main() {
     confirm "STEP 0: reboot to bootloader now?" || exit 0
     run 0 "Reboot to bootloader" adb reboot bootloader
     fastboot_wait
-    unlock_service
+    unlock_service || exit 1
     restore_gpt_and_apps
   else
-    unlock_preload
+    unlock_preload || exit 1
     restore_gpt_and_apps
   fi
 
